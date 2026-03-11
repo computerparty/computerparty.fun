@@ -1,0 +1,1493 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>WIND SIMULATOR</title>
+<link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap" rel="stylesheet">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #0F0A2E; overflow: hidden; font-family: 'Press Start 2P', monospace; }
+  canvas { display: block; position: fixed; top: 0; left: 0; }
+  #scanlines {
+    position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+    pointer-events: none;
+    background: repeating-linear-gradient(
+      to bottom,
+      transparent 0px, transparent 3px,
+      rgba(0,0,0,0.08) 3px, rgba(0,0,0,0.08) 4px
+    );
+    z-index: 10;
+  }
+  #screen {
+    position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+    display: flex; flex-direction: column;
+    justify-content: center; align-items: center;
+    z-index: 5; pointer-events: none;
+  }
+  #startScreen { display: flex; flex-direction: column; align-items: center; }
+  #title {
+    font-size: clamp(18px, 3vw, 40px);
+    color: #F5E6C8;
+    text-shadow: 3px 3px 0 #7A3A00, -1px -1px 0 #3D1800;
+    letter-spacing: 4px; line-height: 1.6; text-align: center;
+  }
+  #subtitle { font-size: clamp(7px, 1vw, 13px); color: #C47A20; margin-top: 12px; letter-spacing: 2px; }
+  #clickPrompt {
+    font-size: clamp(8px, 1.1vw, 14px); color: #F5E6C8;
+    margin-top: 50px; animation: blink 1s step-end infinite; letter-spacing: 2px;
+  }
+  @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
+  #version { font-size: clamp(5px, 0.65vw, 9px); color: #7A4A10; margin-top: 70px; letter-spacing: 1px; }
+</style>
+</head>
+<body>
+<canvas id="gameCanvas"></canvas>
+<div id="scanlines"></div>
+<div id="screen">
+  <div id="startScreen">
+    <div id="title">WIND<br>SIMULATOR</div>
+    <div id="subtitle">VERSION 1.0</div>
+    <div id="clickPrompt">CLICK TO PLAY</div>
+    <div id="version">© 2026 COMPUTERPARTY.FUN</div>
+  </div>
+</div>
+
+<script>
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+const startScreen = document.getElementById('startScreen');
+
+let W, H, groundY;
+
+function resize() {
+  W = canvas.width  = window.innerWidth;
+  H = canvas.height = window.innerHeight;
+  groundY = Math.floor(H * 0.82);
+}
+resize();
+window.addEventListener('resize', () => { resize(); initWisps(); initWindowStates(); initStreetLights(); });
+
+// ── Palette ───────────────────────────────────────────────────────────────────
+const CREAM = '#F5E6C8';
+const LEAF1  = '#C84A00';
+const LEAF2  = '#8B2200';
+const TWIG   = '#3A1A00';
+
+let gameRunning = false;
+let audioCtx = null;
+let windGainNode = null;
+
+// ── Day / Night Cycle ─────────────────────────────────────────────────────────
+// One full cycle = 36000 frames (~10 min at 60fps)
+// Phase 0.0 = deep night → 0.25 = pre-dawn → 0.5 = dusk/sunset → 0.75 = late dusk → 1.0 = deep night
+const CYCLE_FRAMES = 36000;
+let cycleFrame = 0; // starts at dusk (phase ~0.5)
+
+function getCyclePhase() {
+  return cycleFrame / CYCLE_FRAMES;
+}
+
+// smoothstep for gentle transitions
+function smoothstep(t) {
+  return t * t * (3 - 2 * t);
+}
+
+// Returns a 0..1 "darkness" value: 0 = full dusk, 1 = full night
+// Uses a double-peaked curve so there's a real dusk and a real night
+function getDarkness() {
+  const p = getCyclePhase();
+  // dusk region: 0.4–0.6 (p around 0.5 is brightest/most colorful dusk)
+  // night: 0.0–0.25 and 0.75–1.0
+  // Use a cosine: darkness = (1 - cos(2π·p)) / 2
+  // This gives 0 at p=0.5 (dusk peak) and 1 at p=0 and p=1 (deep night)
+  return (1 - Math.cos(2 * Math.PI * p)) / 2;
+}
+
+// Street lights should be on when it's dark enough
+function getStreetLightBrightness() {
+  const d = getDarkness();
+  // Lights come on above darkness threshold ~0.4, fully on at ~0.7
+  const t = Math.max(0, (d - 0.35) / 0.35);
+  return Math.min(1, t);
+}
+
+// Interpolate two hex colors
+function lerpColor(hex1, hex2, t) {
+  const r1 = parseInt(hex1.slice(1,3),16), g1 = parseInt(hex1.slice(3,5),16), b1 = parseInt(hex1.slice(5,7),16);
+  const r2 = parseInt(hex2.slice(1,3),16), g2 = parseInt(hex2.slice(3,5),16), b2 = parseInt(hex2.slice(5,7),16);
+  const r = Math.round(r1 + (r2 - r1) * t);
+  const g = Math.round(g1 + (g2 - g1) * t);
+  const b = Math.round(b1 + (b2 - b1) * t);
+  return `rgb(${r},${g},${b})`;
+}
+
+// Sky gradient stops: [position, duskColor, nightColor]
+// dusk = the warm sunset palette; night = cold deep blue-black
+const SKY_STOPS = [
+  [0.00, '#080618', '#020108'],   // near-black top: dusk indigo vs pure night
+  [0.12, '#110C30', '#05041A'],
+  [0.28, '#1E1050', '#080522'],
+  [0.46, '#4A1E6A', '#0A0820'],   // purple band fades to near-black at night
+  [0.62, '#8E3D72', '#0D0B28'],   // mauve disappears
+  [0.76, '#C4583C', '#0F0E2A'],   // coral disappears
+  [0.90, '#E07820', '#0C0C24'],   // amber disappears
+  [1.00, '#A84010', '#080818'],   // burnt horizon → just dark
+];
+
+// ── Wind strength ─────────────────────────────────────────────────────────────
+let windStrength = 0.5;
+let windTarget   = 0.5;
+let windTimer    = 0;
+let windNextChange = 400 + Math.random() * 600;
+
+function updateWind() {
+  windTimer++;
+  if (windTimer >= windNextChange) {
+    windTimer = 0;
+    windNextChange = 300 + Math.random() * 900;
+    const r = Math.random();
+    if      (r < 0.20) windTarget = Math.random() * 0.15;
+    else if (r < 0.45) windTarget = 0.15 + Math.random() * 0.25;
+    else if (r < 0.75) windTarget = 0.40 + Math.random() * 0.35;
+    else               windTarget = 0.75 + Math.random() * 0.25;
+  }
+  windStrength += (windTarget - windStrength) * 0.004;
+  if (windGainNode && audioCtx) {
+    windGainNode.gain.setTargetAtTime(
+      0.02 + windStrength * 0.22, audioCtx.currentTime, 0.8
+    );
+  }
+}
+
+// ── Window flicker state ──────────────────────────────────────────────────────
+let leftWins  = [];
+let rightWins = [];
+let winTimer  = 0;
+let winNext   = 2400 + Math.random() * 3600;
+
+function initWindowStates() {
+  leftWins  = Array.from({length: 10}, () => Math.random() < 0.45);
+  rightWins = Array.from({length:  8}, () => Math.random() < 0.35);
+}
+initWindowStates();
+
+function updateWindowFlicker() {
+  winTimer++;
+  if (winTimer >= winNext) {
+    winTimer = 0;
+    winNext  = 2400 + Math.random() * 3600;
+    const total = leftWins.length + rightWins.length;
+    const idx = Math.floor(Math.random() * total);
+    if (idx < leftWins.length) leftWins[idx] = !leftWins[idx];
+    else rightWins[idx - leftWins.length] = !rightWins[idx - leftWins.length];
+  }
+}
+
+// ── Street Lights ─────────────────────────────────────────────────────────────
+let streetLights = [];
+
+function initStreetLights() {
+  streetLights = [];
+  // Place lights at intervals across the scene, just above groundY
+  const positions = [0.08, 0.22, 0.50, 0.62, 0.88];
+  for (const xFrac of positions) {
+    streetLights.push({
+      x: Math.floor(W * xFrac),
+      poleH: Math.floor(H * 0.072),
+      armLen: Math.floor(H * 0.022),
+    });
+  }
+}
+initStreetLights();
+
+function drawStreetLights() {
+  const brightness = getStreetLightBrightness();
+  if (brightness <= 0) return;
+
+  for (const sl of streetLights) {
+    const poleX = sl.x;
+    const poleTopY = groundY - sl.poleH;
+    const lampX = poleX + sl.armLen;
+    const lampY = poleTopY;
+
+    // Cone of light on ground — soft sodium yellow
+    if (brightness > 0.05) {
+      const coneAlpha = brightness * 0.13;
+      const coneW = sl.poleH * 1.1;
+      const coneH = sl.poleH * 0.7;
+      const cg = ctx.createRadialGradient(lampX, lampY + 6, 2, lampX, lampY + coneH * 0.5, coneH);
+      cg.addColorStop(0, `rgba(255,200,80,${coneAlpha * 1.4})`);
+      cg.addColorStop(0.5, `rgba(255,180,50,${coneAlpha * 0.5})`);
+      cg.addColorStop(1, `rgba(255,160,30,0)`);
+      ctx.save();
+      ctx.beginPath();
+      ctx.moveTo(lampX, lampY + 4);
+      ctx.lineTo(lampX - coneW * 0.5, groundY);
+      ctx.lineTo(lampX + coneW * 0.5, groundY);
+      ctx.closePath();
+      ctx.fillStyle = cg;
+      ctx.fill();
+      ctx.restore();
+    }
+
+    // Halo glow around lamp head
+    if (brightness > 0.1) {
+      const haloAlpha = brightness * 0.25;
+      const hg = ctx.createRadialGradient(lampX, lampY, 0, lampX, lampY, sl.armLen * 1.8);
+      hg.addColorStop(0, `rgba(255,220,100,${haloAlpha})`);
+      hg.addColorStop(1, 'rgba(255,180,50,0)');
+      ctx.fillStyle = hg;
+      ctx.beginPath();
+      ctx.arc(lampX, lampY, sl.armLen * 1.8, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    // Pole
+    ctx.fillStyle = `rgba(20,22,28,${0.7 + brightness * 0.3})`;
+    ctx.fillRect(poleX - 1, poleTopY, 2, sl.poleH);
+
+    // Arm
+    ctx.fillStyle = `rgba(20,22,28,${0.7 + brightness * 0.3})`;
+    ctx.fillRect(poleX, poleTopY, sl.armLen, 2);
+
+    // Lamp head
+    const lampAlpha = brightness;
+    ctx.fillStyle = `rgba(255,220,100,${lampAlpha * 0.9})`;
+    ctx.fillRect(lampX - 3, lampY - 2, 6, 4);
+    // inner bright spot
+    ctx.fillStyle = `rgba(255,250,220,${lampAlpha})`;
+    ctx.fillRect(lampX - 1, lampY - 1, 2, 2);
+  }
+}
+
+// ── Wisps ─────────────────────────────────────────────────────────────────────
+const wisps = [];
+
+function makeWisp(spread) {
+  const r = Math.random();
+  const type = r < 0.52 ? 'streak' : r < 0.78 ? 'wisp' : 'curl';
+
+  const y = 10 + Math.random() * (groundY * 0.97);
+  const baseSpeed = type === 'streak' ? 3.5 + Math.random() * 7.5
+                  : type === 'wisp'   ? 1.2 + Math.random() * 3.5
+                                      : 0.6 + Math.random() * 2.2;
+  const len = type === 'streak' ? 60  + Math.random() * 160
+            : type === 'wisp'   ? 28  + Math.random() * 80
+                                : 14  + Math.random() * 40;
+
+  let cy1, cy2;
+  if (type === 'curl') {
+    const mag = 28 + Math.random() * 38;
+    cy1 =  (Math.random() < 0.5 ? 1 : -1) * mag;
+    cy2 = -cy1 * (0.5 + Math.random() * 0.9);
+  } else if (type === 'wisp') {
+    cy1 = (Math.random() - 0.5) * 55;
+    cy2 = cy1 * (Math.random() < 0.45 ? -1 : 1) * (0.4 + Math.random() * 1.1);
+  } else {
+    cy1 = (Math.random() - 0.5) * 22;
+    cy2 = cy1 * (Math.random() < 0.4 ? -0.6 : 0.8) + (Math.random() - 0.5) * 14;
+  }
+
+  const pxSz = type === 'streak' ? 1
+             : type === 'wisp'   ? (Math.random() < 0.5 ? 1 : 2)
+                                 : (Math.random() < 0.4 ? 2 : 3);
+  const dashSkip = type === 'streak' ? (Math.random() < 0.5 ? 0 : 1)
+                 : type === 'wisp'   ? (Math.random() < 0.6 ? 1 : 2)
+                                     : 1;
+
+  return {
+    type, pxSz, dashSkip,
+    x: spread ? (-len + Math.random() * (W + len)) : -len - Math.random() * 60,
+    y,
+    baseSpeed,
+    len, cy1, cy2,
+    alpha: type === 'streak' ? 0.12 + Math.random() * 0.50
+         : type === 'wisp'   ? 0.08 + Math.random() * 0.32
+                             : 0.06 + Math.random() * 0.20,
+    vy: (Math.random() - 0.5) * 0.07,
+  };
+}
+
+function initWisps() {
+  wisps.length = 0;
+  const n = Math.min(75, Math.max(35, Math.floor(W / 22)));
+  for (let i = 0; i < n; i++) wisps.push(makeWisp(true));
+}
+
+function updateWisps() {
+  for (const w of wisps) {
+    const spd = w.baseSpeed * (0.15 + windStrength * 0.85);
+    w.x += spd;
+    w.y += w.vy;
+    if (w.x > W + 30) Object.assign(w, makeWisp(false));
+  }
+}
+
+function drawPixelBezier(w) {
+  const x0 = w.x,         y0 = w.y;
+  const x3 = w.x + w.len, y3 = w.y + w.vy * w.len * 9;
+  const x1 = x0 + w.len * 0.33, y1 = y0 + w.cy1;
+  const x2 = x0 + w.len * 0.67, y2 = y0 + w.cy2;
+
+  const dist = Math.hypot(x3 - x0, y3 - y0);
+  const steps = Math.max(4, Math.ceil(dist / (w.pxSz * 2.2)));
+
+  const darkness = getDarkness();
+  // At dusk: warm cream. At night: cold silver-blue, barely visible.
+  const wispColor = darkness < 0.5
+    ? CREAM
+    : `rgb(${Math.round(215 - darkness * 50)},${Math.round(220 - darkness * 30)},${Math.round(230 + darkness * 15)})`;
+
+  // Night wisps are much dimmer — pressure not light
+  const nightDim = 1 - darkness * 0.65;
+  ctx.globalAlpha = w.alpha * (0.3 + windStrength * 0.7) * nightDim;
+  ctx.fillStyle = wispColor;
+  const ps = w.pxSz;
+
+  for (let i = 0; i <= steps; i++) {
+    if (w.dashSkip > 0 && (i % (w.dashSkip + 1)) !== 0) continue;
+    const t = i / steps;
+    const mt = 1 - t;
+    const px = mt*mt*mt*x0 + 3*mt*mt*t*x1 + 3*mt*t*t*x2 + t*t*t*x3;
+    const py = mt*mt*mt*y0 + 3*mt*mt*t*y1 + 3*mt*t*t*y2 + t*t*t*y3;
+    ctx.fillRect(Math.round(px / ps) * ps, Math.round(py / ps) * ps, ps, ps);
+  }
+}
+
+function drawWisps() {
+  ctx.save();
+  for (const w of wisps) drawPixelBezier(w);
+  ctx.restore();
+}
+
+
+
+// ── Audio ─────────────────────────────────────────────────────────────────────
+function initAudio() {
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  const bufLen = audioCtx.sampleRate * 2;
+  const buf = audioCtx.createBuffer(1, bufLen, audioCtx.sampleRate);
+  const data = buf.getChannelData(0);
+  for (let i = 0; i < bufLen; i++) data[i] = Math.random() * 2 - 1;
+  const noise = audioCtx.createBufferSource();
+  noise.buffer = buf; noise.loop = true;
+  const bp = audioCtx.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = 400; bp.Q.value = 0.5;
+  const lp = audioCtx.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 800;
+  const wg = audioCtx.createGain(); wg.gain.value = 0.10 + windStrength * 0.18;
+  const lfo = audioCtx.createOscillator(); lfo.frequency.value = 0.12;
+  const lfoGain = audioCtx.createGain(); lfoGain.gain.value = 0.06;
+  lfo.connect(lfoGain); lfoGain.connect(wg.gain); lfo.start();
+  noise.connect(bp); bp.connect(lp); lp.connect(wg); wg.connect(audioCtx.destination);
+  noise.start();
+  windGainNode = wg;
+}
+
+function playWhoosh() {
+  if (!audioCtx) return;
+  const g = audioCtx.createGain();
+  const bp = audioCtx.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = 600; bp.Q.value = 1.5;
+  const bufLen = audioCtx.sampleRate * 0.4;
+  const buf = audioCtx.createBuffer(1, bufLen, audioCtx.sampleRate);
+  const data = buf.getChannelData(0);
+  for (let i = 0; i < bufLen; i++) data[i] = Math.random() * 2 - 1;
+  const src = audioCtx.createBufferSource(); src.buffer = buf;
+  g.gain.setValueAtTime(0, audioCtx.currentTime);
+  g.gain.linearRampToValueAtTime(0.22 * windStrength, audioCtx.currentTime + 0.05);
+  g.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.4);
+  src.connect(bp); bp.connect(g); g.connect(audioCtx.destination);
+  src.start(); src.stop(audioCtx.currentTime + 0.4);
+}
+
+// ── Sky ───────────────────────────────────────────────────────────────────────
+function drawSky() {
+  const darkness = getDarkness();
+  const grad = ctx.createLinearGradient(0, 0, 0, groundY);
+
+  for (const [pos, duskCol, nightCol] of SKY_STOPS) {
+    grad.addColorStop(pos, lerpColor(duskCol, nightCol, darkness));
+  }
+
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, W, groundY + 2);
+
+  // Stars — only visible when dark enough
+  if (darkness > 0.3) {
+    drawStars(darkness);
+  }
+
+  // Moon — appears as darkness rises, fixed position upper-right quadrant
+  if (darkness > 0.25) {
+    drawMoon(darkness);
+  }
+
+  // warm glow at horizon — fades with darkness
+  const horizonGlowAlpha = (1 - darkness) * 0.10;
+  if (horizonGlowAlpha > 0.005) {
+    const hg = ctx.createLinearGradient(0, groundY - H * 0.05, 0, groundY);
+    hg.addColorStop(0, 'rgba(255,180,60,0)');
+    hg.addColorStop(1, `rgba(255,160,40,${horizonGlowAlpha})`);
+    ctx.fillStyle = hg;
+    ctx.fillRect(0, groundY - H * 0.05, W, H * 0.05);
+  }
+}
+
+// ── Stars ─────────────────────────────────────────────────────────────────────
+// Pre-generate star positions so they don't shimmer/jitter every frame
+let starField = null;
+function ensureStars() {
+  if (starField) return;
+  starField = [];
+  const count = 120;
+  for (let i = 0; i < count; i++) {
+    starField.push({
+      x: Math.random(),         // fraction of W
+      y: Math.random() * 0.75, // fraction of groundY (upper 75% of sky)
+      size: Math.random() < 0.85 ? 1 : 2,
+      twinkleOffset: Math.random() * Math.PI * 2,
+      twinkleSpeed: 0.008 + Math.random() * 0.012,
+      brightness: 0.4 + Math.random() * 0.6,
+    });
+    starField[i].twinklePhase = 0;
+  }
+}
+
+function drawStars(darkness) {
+  ensureStars();
+  const baseAlpha = Math.max(0, (darkness - 0.3) / 0.7);
+  ctx.save();
+  for (const s of starField) {
+    s.twinklePhase = (s.twinklePhase || 0) + s.twinkleSpeed;
+    const twinkle = 0.7 + 0.3 * Math.sin(s.twinklePhase + s.twinkleOffset);
+    const alpha = baseAlpha * s.brightness * twinkle;
+    if (alpha < 0.02) continue;
+    ctx.globalAlpha = alpha;
+    ctx.fillStyle = '#F5F0E8';
+    const sx = Math.floor(s.x * W);
+    const sy = Math.floor(s.y * groundY);
+    ctx.fillRect(sx, sy, s.size, s.size);
+  }
+  ctx.globalAlpha = 1;
+  ctx.restore();
+}
+
+// ── Moon ──────────────────────────────────────────────────────────────────────
+// Pre-seeded crater data so they don't move frame to frame
+const MOON_CRATERS = [
+  { dx: 0.28, dy: -0.18, r: 0.14, depth: 0.7 },
+  { dx: -0.15, dy: 0.30, r: 0.09, depth: 0.5 },
+  { dx: 0.42, dy: 0.22, r: 0.07, depth: 0.6 },
+  { dx: -0.32, dy: -0.10, r: 0.11, depth: 0.4 },
+  { dx: 0.08, dy: -0.38, r: 0.08, depth: 0.55 },
+  { dx: 0.35, dy: -0.40, r: 0.05, depth: 0.45 },
+  { dx: -0.22, dy: 0.44, r: 0.06, depth: 0.35 },
+  { dx: 0.18, dy: 0.38, r: 0.05, depth: 0.5  },
+  { dx: -0.40, dy: 0.18, r: 0.04, depth: 0.3  },
+  { dx: 0.50, dy: -0.05, r: 0.04, depth: 0.4  },
+];
+
+function drawMoon(darkness) {
+  const alpha = Math.max(0, (darkness - 0.25) / 0.75);
+  if (alpha < 0.01) return;
+
+  const mx = Math.floor(W * 0.76);
+  const my = Math.floor(groundY * 0.18);
+  const r  = Math.max(12, Math.floor(H * 0.032));
+
+  ctx.save();
+
+  // Clip everything to the moon disc so nothing bleeds outside
+  ctx.beginPath();
+  ctx.arc(mx, my, r, 0, Math.PI * 2);
+  ctx.clip();
+
+  // ── Base disc — limb darkening: center brighter, edge dims ────────────────
+  ctx.globalAlpha = alpha * 0.88;
+  const limbGrad = ctx.createRadialGradient(mx - r * 0.12, my - r * 0.08, 0, mx, my, r);
+  limbGrad.addColorStop(0,   'rgb(242,236,220)');
+  limbGrad.addColorStop(0.6, 'rgb(228,220,200)');
+  limbGrad.addColorStop(1,   'rgb(185,175,155)'); // limb darkens toward edge
+  ctx.fillStyle = limbGrad;
+  ctx.beginPath();
+  ctx.arc(mx, my, r, 0, Math.PI * 2);
+  ctx.fill();
+
+  // ── Mare (dark regions) — broad, irregular flat patches ───────────────────
+  ctx.globalAlpha = alpha * 0.22;
+  ctx.fillStyle = 'rgb(130,120,105)';
+  // Mare Imbrium-ish blob upper left of disc
+  ctx.beginPath();
+  ctx.ellipse(mx - r * 0.18, my - r * 0.15, r * 0.38, r * 0.28, -0.4, 0, Math.PI * 2);
+  ctx.fill();
+  // Mare Serenitatis-ish blob
+  ctx.beginPath();
+  ctx.ellipse(mx + r * 0.12, my - r * 0.08, r * 0.22, r * 0.18, 0.3, 0, Math.PI * 2);
+  ctx.fill();
+  // Mare Tranquillitatis-ish
+  ctx.globalAlpha = alpha * 0.16;
+  ctx.beginPath();
+  ctx.ellipse(mx + r * 0.20, my + r * 0.18, r * 0.26, r * 0.20, 0.5, 0, Math.PI * 2);
+  ctx.fill();
+
+  // ── Craters ────────────────────────────────────────────────────────────────
+  for (const c of MOON_CRATERS) {
+    const cx = mx + c.dx * r;
+    const cy = my + c.dy * r;
+    const cr = c.r * r;
+    // Only draw craters that are mostly within the disc
+    if (Math.hypot(c.dx, c.dy) > 0.92) continue;
+
+    // Shadow arc on lower-right of crater (light from upper-left)
+    ctx.globalAlpha = alpha * c.depth * 0.55;
+    ctx.fillStyle = 'rgb(90,82,70)';
+    ctx.beginPath();
+    ctx.arc(cx + cr * 0.15, cy + cr * 0.1, cr, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Bright rim on upper-left
+    ctx.globalAlpha = alpha * c.depth * 0.35;
+    ctx.fillStyle = 'rgb(255,250,238)';
+    ctx.beginPath();
+    ctx.arc(cx - cr * 0.12, cy - cr * 0.1, cr * 0.75, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Floor — slightly lighter than shadow
+    ctx.globalAlpha = alpha * c.depth * 0.25;
+    ctx.fillStyle = 'rgb(165,155,138)';
+    ctx.beginPath();
+    ctx.arc(cx, cy, cr * 0.55, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  // ── Terminator — soft shadow from the right covering ~40% of disc ─────────
+  // Done as a radial gradient offset way to the right, so the shadow falls off
+  // gradually rather than as a hard crescent line
+  ctx.globalAlpha = alpha * 0.92;
+  const termX = mx + r * 0.52; // shadow source offset right
+  const termGrad = ctx.createRadialGradient(termX, my, 0, termX, my, r * 1.55);
+  termGrad.addColorStop(0,    'rgba(6,8,16,0.96)');  // deep shadow near center
+  termGrad.addColorStop(0.30, 'rgba(6,8,16,0.88)');
+  termGrad.addColorStop(0.52, 'rgba(6,8,16,0.55)');  // soft transition zone
+  termGrad.addColorStop(0.68, 'rgba(6,8,16,0.18)');
+  termGrad.addColorStop(0.82, 'rgba(6,8,16,0.04)');
+  termGrad.addColorStop(1,    'rgba(6,8,16,0)');
+  ctx.fillStyle = termGrad;
+  ctx.beginPath();
+  ctx.arc(mx, my, r, 0, Math.PI * 2);
+  ctx.fill();
+
+  ctx.restore();
+
+  // ── Outer atmosphere bleed — very faint, outside the clip ─────────────────
+  ctx.save();
+  ctx.globalAlpha = alpha * 0.035;
+  const atmosGrad = ctx.createRadialGradient(mx, my, r * 0.85, mx, my, r * 2.0);
+  atmosGrad.addColorStop(0, 'rgba(220,212,195,1)');
+  atmosGrad.addColorStop(1, 'rgba(220,212,195,0)');
+  ctx.fillStyle = atmosGrad;
+  ctx.beginPath();
+  ctx.arc(mx, my, r * 2.0, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+}
+
+
+function drawBackground() {
+  const darkness = getDarkness();
+
+  // Building color darkens slightly at night (already dark, just slightly more contrast)
+  const bldMod = 1 - darkness * 0.15;
+
+  function darkenBuilding(hex) {
+    const r = parseInt(hex.slice(1,3),16);
+    const g = parseInt(hex.slice(3,5),16);
+    const b = parseInt(hex.slice(5,7),16);
+    return `rgb(${Math.round(r*bldMod)},${Math.round(g*bldMod)},${Math.round(b*bldMod)})`;
+  }
+
+  // ── Self-storage facility — offset left of center ────────────────────────
+  const sfX = Math.floor(W * 0.22);
+  const sfW = Math.floor(W * 0.20);
+  const flH = Math.floor(H * 0.075);
+  const sfH = flH * 2 + 6;
+  const sfY = groundY - sfH;
+
+  for (let i = 0; i < 3; i++) {
+    const pad = 20 + i * 18;
+    const glowA = (1 - darkness) * (0.05 - i * 0.013);
+    if (glowA > 0) {
+      ctx.fillStyle = `rgba(255,155,35,${glowA})`;
+      ctx.fillRect(sfX - pad, sfY - pad * 0.4, sfW + pad * 2, sfH + pad * 0.6);
+    }
+  }
+
+  ctx.fillStyle = darkenBuilding('#151C2A');
+  ctx.fillRect(sfX, sfY, sfW, sfH);
+  ctx.fillStyle = darkenBuilding('#1C2636');
+  ctx.fillRect(sfX - 4, sfY - 5, sfW + 8, 7);
+  ctx.fillStyle = darkenBuilding('#0E1420');
+  ctx.fillRect(sfX, sfY - 12, sfW, 7);
+  ctx.fillStyle = '#D06818';
+  for (let sx = sfX + 10; sx < sfX + sfW - 10; sx += 16) {
+    ctx.fillRect(sx, sfY - 10, 9, 4);
+  }
+
+  const doorW  = Math.max(10, Math.floor(sfW / 12));
+  const doorGp = Math.max(2,  Math.floor(doorW * 0.22));
+  const stride  = doorW + doorGp;
+  const numD    = Math.floor((sfW - 14) / stride);
+  const doorOX  = sfX + Math.floor((sfW - numD * stride + doorGp) / 2);
+  const doorH   = Math.floor(flH * 0.68);
+
+  for (let fl = 0; fl < 2; fl++) {
+    const flY = sfY + fl * flH;
+    ctx.fillStyle = darkenBuilding('#1E2C3E');
+    ctx.fillRect(sfX, flY, sfW, 4);
+    const dY = flY + Math.floor((flH - doorH) / 2) + 3;
+
+    for (let d = 0; d < numD; d++) {
+      const dX = doorOX + d * stride;
+      ctx.fillStyle = 'rgba(255,165,45,0.15)';
+      ctx.fillRect(dX - 2, dY - 2, doorW + 4, doorH + 4);
+      ctx.fillStyle = darkenBuilding('#283545');
+      ctx.fillRect(dX, dY, doorW, doorH);
+      const slats = 4;
+      const sH = Math.floor(doorH / slats);
+      for (let sl = 0; sl < slats; sl++) {
+        ctx.fillStyle = sl % 2 === 0 ? darkenBuilding('#2E3E52') : darkenBuilding('#222E40');
+        ctx.fillRect(dX + 1, dY + sl * sH + 1, doorW - 2, sH - 1);
+      }
+      ctx.fillStyle = 'rgba(255,195,75,0.55)';
+      ctx.fillRect(dX, dY, 1, doorH);
+      ctx.fillRect(dX + doorW - 1, dY, 1, doorH);
+      ctx.fillRect(dX, dY, doorW, 1);
+      ctx.fillRect(dX, dY + doorH - 1, doorW, 1);
+    }
+  }
+
+  // ── Left big-box ──────────────────────────────────────────────────────────
+  const lbX = Math.floor(W * 0.01);
+  const lbW = Math.floor(W * 0.24);
+  const lbH = Math.floor(H * 0.11);
+  const lbY = groundY - lbH;
+
+  ctx.fillStyle = darkenBuilding('#131A24');
+  ctx.fillRect(lbX, lbY, lbW, lbH);
+  ctx.fillStyle = darkenBuilding('#1A2230');
+  ctx.fillRect(lbX - 2, lbY - 5, lbW + 4, 6);
+
+  ctx.fillStyle = darkenBuilding('#0F1520');
+  for (const p of [0.10, 0.28, 0.50, 0.70, 0.85]) {
+    const hx = lbX + Math.floor(lbW * p);
+    const hw = Math.floor(lbW * 0.08);
+    ctx.fillRect(hx, lbY - 10, hw, 5);
+    ctx.fillRect(hx + Math.floor(hw*0.3), lbY - 13, Math.floor(hw*0.4), 3);
+  }
+
+  ctx.fillStyle = 'rgba(255,255,255,0.014)';
+  for (let ly = lbY + 4; ly < groundY - 2; ly += 5) ctx.fillRect(lbX, ly, lbW, 1);
+
+  // office windows — left building
+  {
+    const wRows = 2, wCols = 5;
+    const wW = Math.floor(lbW * 0.08), wH = Math.floor(lbH * 0.20);
+    const wGapX = Math.floor((lbW - wCols * wW) / (wCols + 1));
+    const wGapY = Math.floor(lbH * 0.15);
+    for (let row = 0; row < wRows; row++) {
+      for (let col = 0; col < wCols; col++) {
+        const wx = lbX + wGapX + col * (wW + wGapX);
+        const wy = lbY + wGapY + row * (wH + wGapY);
+        const lit = leftWins[row * wCols + col];
+        if (lit) {
+          // Windows appear brighter at night
+          const winAlpha = 0.45 + darkness * 0.35;
+          ctx.fillStyle = `rgba(255,210,100,0.18)`;
+          ctx.fillRect(wx - 2, wy - 2, wW + 4, wH + 4);
+          ctx.fillStyle = `rgba(255,220,130,${winAlpha})`;
+          ctx.fillRect(wx, wy, wW, wH);
+          ctx.fillStyle = `rgba(255,240,180,${winAlpha + 0.2})`;
+          ctx.fillRect(wx + 1, wy + 1, wW - 2, 1);
+        } else {
+          ctx.fillStyle = '#0A0F18';
+          ctx.fillRect(wx, wy, wW, wH);
+        }
+      }
+    }
+  }
+
+  // ── Right big-box ─────────────────────────────────────────────────────────
+  const rbX = Math.floor(W * 0.68);
+  const rbW = Math.floor(W * 0.20);
+  const rbH = Math.floor(H * 0.095);
+  const rbY = groundY - rbH;
+
+  ctx.fillStyle = darkenBuilding('#111822');
+  ctx.fillRect(rbX, rbY, rbW, rbH);
+  ctx.fillStyle = darkenBuilding('#18202E');
+  ctx.fillRect(rbX - 2, rbY - 4, rbW + 4, 5);
+
+  ctx.fillStyle = darkenBuilding('#0D1420');
+  ctx.fillRect(rbX + Math.floor(rbW*0.14), rbY - 9, Math.floor(rbW*0.10), 5);
+  ctx.fillRect(rbX + Math.floor(rbW*0.42), rbY - 8, Math.floor(rbW*0.08), 4);
+  ctx.fillRect(rbX + Math.floor(rbW*0.72), rbY - 10, Math.floor(rbW*0.12), 6);
+
+  ctx.fillStyle = 'rgba(255,255,255,0.011)';
+  for (let ly = rbY + 4; ly < groundY - 2; ly += 5) ctx.fillRect(rbX, ly, rbW, 1);
+
+  // office windows — right building
+  {
+    const wRows = 2, wCols = 4;
+    const wW = Math.floor(rbW * 0.09), wH = Math.floor(rbH * 0.22);
+    const wGapX = Math.floor((rbW - wCols * wW) / (wCols + 1));
+    const wGapY = Math.floor(rbH * 0.12);
+    for (let row = 0; row < wRows; row++) {
+      for (let col = 0; col < wCols; col++) {
+        const wx = rbX + wGapX + col * (wW + wGapX);
+        const wy = rbY + wGapY + row * (wH + wGapY);
+        const lit = rightWins[row * wCols + col];
+        if (lit) {
+          const winAlpha = 0.40 + darkness * 0.30;
+          ctx.fillStyle = `rgba(255,210,100,0.15)`;
+          ctx.fillRect(wx - 2, wy - 2, wW + 4, wH + 4);
+          ctx.fillStyle = `rgba(245,215,120,${winAlpha})`;
+          ctx.fillRect(wx, wy, wW, wH);
+          ctx.fillStyle = `rgba(255,240,180,${winAlpha + 0.2})`;
+          ctx.fillRect(wx + 1, wy + 1, wW - 2, 1);
+        } else {
+          ctx.fillStyle = '#090E16';
+          ctx.fillRect(wx, wy, wW, wH);
+        }
+      }
+    }
+  }
+
+  // ── Trees — repositioned around new building layout ───────────────────────
+  // One just right of storage facility, one mid-gap, one far right
+  drawTree(Math.floor(W * 0.455), groundY, Math.floor(H * 0.105));
+  drawTree(Math.floor(W * 0.580), groundY, Math.floor(H * 0.088));
+  drawTree(Math.floor(W * 0.895), groundY, Math.floor(H * 0.072));
+
+  // ── Street lights (drawn after buildings, before ground) ──────────────────
+  drawStreetLights();
+
+  // ── Asphalt ground — committed dark plane ─────────────────────────────────
+  ctx.fillStyle = '#0C1016';
+  ctx.fillRect(0, groundY, W, H - groundY);
+  // Edge seam
+  ctx.fillStyle = '#1A2230';
+  ctx.fillRect(0, groundY, W, 2);
+
+  // Two faint lane lines — visible enough to read as pavement, not shimmer
+  const laneY1 = groundY + Math.floor((H - groundY) * 0.45);
+  const laneY2 = groundY + Math.floor((H - groundY) * 0.72);
+  ctx.fillStyle = 'rgba(255,255,255,0.07)';
+  for (const ly of [laneY1, laneY2]) {
+    for (let lx = Math.floor(W * 0.06); lx < W * 0.94; lx += 52) {
+      ctx.fillRect(Math.floor(lx), ly, 28, 2);
+    }
+  }
+
+  // Ground-level light pools from street lights
+  const slBrightness = getStreetLightBrightness();
+  if (slBrightness > 0.05) {
+    for (const sl of streetLights) {
+      const poolAlpha = slBrightness * 0.09;
+      const pg = ctx.createRadialGradient(sl.x + sl.armLen, groundY, 0, sl.x + sl.armLen, groundY, sl.poleH * 0.6);
+      pg.addColorStop(0, `rgba(255,190,60,${poolAlpha})`);
+      pg.addColorStop(1, 'rgba(255,160,30,0)');
+      ctx.fillStyle = pg;
+      ctx.beginPath();
+      ctx.ellipse(sl.x + sl.armLen, groundY + 4, sl.poleH * 0.55, (H - groundY) * 0.6, 0, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  // ── Foreground silhouettes — close, dark, no detail ───────────────────────
+  drawForeground();
+}
+
+function drawTree(x, baseY, h) {
+  const tw = Math.max(1, Math.floor(h * 0.035));
+  ctx.fillStyle = '#0C1016';
+  ctx.fillRect(x - tw, baseY - h, tw * 2, h);
+  const br = [
+    [-0.30, 0.28], [0.28, 0.22], [-0.22, 0.42], [0.35, 0.38],
+    [-0.12, 0.18], [0.15, 0.32], [-0.38, 0.50], [0.40, 0.52],
+    [-0.18, 0.60], [0.22, 0.58],
+  ];
+  for (const [dx, dy] of br) {
+    const bx = x + Math.floor(dx * h * 0.5);
+    const by = baseY - h + Math.floor(dy * h);
+    const sz = Math.max(2, Math.floor(h * 0.055));
+    ctx.fillRect(bx - sz, by - sz, sz * 2, sz);
+    ctx.fillRect(bx - Math.floor(sz*0.5), by - sz * 2, sz, sz);
+  }
+}
+
+// ── Foreground silhouettes — close objects, pure dark mass ───────────────────
+function drawForeground() {
+  ctx.fillStyle = '#060810';
+
+  // Left edge: heavy utility pole — close means thick, no apology
+  const poleX = Math.floor(W * 0.03);
+  const poleW = Math.max(10, Math.floor(W * 0.018)); // tripled from before
+  ctx.fillRect(poleX, Math.floor(H * 0.06), poleW, groundY - Math.floor(H * 0.06));
+
+  // Cross-arm — proportionally heavier
+  const armY = Math.floor(H * 0.15);
+  const armLen = Math.floor(W * 0.038);
+  const armH   = Math.max(4, Math.floor(H * 0.007));
+  ctx.fillRect(poleX - armLen, armY, armLen * 2 + poleW, armH);
+
+  // Insulators — bigger nubs to match
+  ctx.fillRect(poleX - armLen - 3, armY - 4, 7, 10);
+  ctx.fillRect(poleX + armLen + poleW - 4, armY - 4, 7, 10);
+
+  // Second lower cross-arm — utility poles usually have two
+  const armY2 = Math.floor(H * 0.24);
+  const armLen2 = Math.floor(W * 0.024);
+  ctx.fillRect(poleX - armLen2, armY2, armLen2 * 2 + poleW, Math.max(3, Math.floor(H * 0.005)));
+  ctx.fillRect(poleX - armLen2 - 2, armY2 - 3, 5, 8);
+  ctx.fillRect(poleX + armLen2 + poleW - 3, armY2 - 3, 5, 8);
+
+  // Right edge: ambiguous dark mass — just a shape, not a named object
+  // Irregular top edge so it reads as "something" not a box
+  const massW = Math.floor(W * 0.055);
+  const massX = W - massW;
+  const massBaseH = Math.floor(H * 0.09);
+  const massY = groundY - massBaseH;
+
+  ctx.beginPath();
+  ctx.moveTo(massX,         groundY + (H - groundY)); // bottom-left
+  ctx.lineTo(massX,         massY + Math.floor(massBaseH * 0.15));
+  ctx.lineTo(massX + Math.floor(massW * 0.12), massY);
+  ctx.lineTo(massX + Math.floor(massW * 0.38), massY + Math.floor(massBaseH * 0.08));
+  ctx.lineTo(massX + Math.floor(massW * 0.55), massY - Math.floor(massBaseH * 0.05));
+  ctx.lineTo(massX + Math.floor(massW * 0.78), massY + Math.floor(massBaseH * 0.04));
+  ctx.lineTo(massX + massW,  massY + Math.floor(massBaseH * 0.12));
+  ctx.lineTo(massX + massW,  groundY + (H - groundY)); // bottom-right
+  ctx.closePath();
+  ctx.fill();
+
+  // Fence post + rail — left-center, barely there
+  const fenceX = Math.floor(W * 0.10);
+  const fencePostW = Math.max(3, Math.floor(W * 0.004));
+  ctx.fillStyle = '#060810';
+  ctx.fillRect(fenceX, Math.floor(groundY * 0.83), fencePostW, groundY - Math.floor(groundY * 0.83));
+  ctx.fillRect(fenceX - Math.floor(W * 0.04), Math.floor(groundY * 0.85),
+               Math.floor(W * 0.12), Math.max(2, Math.floor(H * 0.002)));
+}
+
+
+
+
+
+
+// ── Flock of birds ────────────────────────────────────────────────────────────
+// States: 'idle' → 'approaching' → 'landing' → 'roosting' → 'departing' → 'idle'
+// The flock perches on the storage facility roofline.
+
+// ── Flock of birds ────────────────────────────────────────────────────────────
+// States per-flock: 'idle' → 'approaching' → 'roosting' → 'departing' → 'idle'
+// Per-bird sub-states: 'flying' | 'descending' | 'landed' | 'departing'
+
+const FLOCK = {
+  state: 'idle',
+  birds: [],
+  timer: 0,
+  nextVisit: (8 + Math.random() * 6) * 60,
+  roostTimer: 0,
+  roostDuration: 0,
+  departIdx: 0,
+};
+
+function getRoofline() {
+  const sfX = Math.floor(W * 0.22);
+  const sfW = Math.floor(W * 0.20);
+  const flH = Math.floor(H * 0.075);
+  const sfH = flH * 2 + 6;
+  const sfY = groundY - sfH;
+  return { x: sfX, y: sfY - 5, w: sfW };
+}
+
+function makeBird(x, y, vx, vy, roostX, roostY, landDelay) {
+  return {
+    x, y, vx, vy,
+    roostX, roostY,
+    subState: 'flying',
+    // Each bird waits a random delay before breaking off to descend
+    landDelay,
+    landTimer: 0,
+    // Per-bird character — loosens the formation
+    maxSpd: 1.6 + Math.random() * 1.4,
+    neighborDist: 55 + Math.random() * 50,
+    separationW: 0.08 + Math.random() * 0.10,
+    cohesionW:   0.0004 + Math.random() * 0.0006,
+    alignW:      0.02  + Math.random() * 0.03,
+    // Roosting shuffle
+    shufflePhase: Math.random() * Math.PI * 2,
+    shuffleSpeed: 0.015 + Math.random() * 0.02,
+    // Departure
+    departDelay: 0,
+    departTimer: 0,
+  };
+}
+
+function initFlock() {
+  FLOCK.birds = [];
+  const roof = getRoofline();
+  const count = 10 + Math.floor(Math.random() * 8);
+
+  // Spawn loosely clustered, offscreen left, at varying heights
+  const startX = -80 - Math.random() * 60;
+  const startY = groundY * (0.12 + Math.random() * 0.28);
+
+  const margin = roof.w * 0.06;
+
+  for (let i = 0; i < count; i++) {
+    const bx = startX + (Math.random() - 0.5) * 60;
+    const by = startY + (Math.random() - 0.5) * 50;
+    const spd = 1.4 + Math.random() * 1.2;
+    const angle = -0.1 + (Math.random() - 0.5) * 0.5;
+    const roostX = roof.x + margin + Math.random() * (roof.w - margin * 2);
+    const roostY = roof.y - 1 + (Math.random() - 0.5) * 3;
+    // Stagger when each bird breaks off to land: 0–180 frames apart
+    const landDelay = i * (8 + Math.random() * 12);
+
+    FLOCK.birds.push(makeBird(
+      bx, by,
+      Math.cos(angle) * spd, Math.sin(angle) * spd,
+      roostX, roostY,
+      landDelay
+    ));
+  }
+
+  FLOCK.roostDuration = (10 + Math.random() * 20) * 60;
+  FLOCK.departIdx = Math.floor(Math.random() * FLOCK.birds.length);
+}
+
+// Loose boids — per-bird weights mean they never look like a tight unit
+function boidForces(b, birds) {
+  let sx = 0, sy = 0;
+  let ax = 0, ay = 0;
+  let cx = 0, cy = 0;
+  let n = 0;
+  const SEP = 18;
+
+  for (const o of birds) {
+    if (o === b || o.subState === 'landed') continue;
+    const dx = b.x - o.x;
+    const dy = b.y - o.y;
+    const dist = Math.hypot(dx, dy) || 0.01;
+    if (dist < SEP) { sx += dx / dist; sy += dy / dist; }
+    if (dist < b.neighborDist) {
+      ax += o.vx; ay += o.vy;
+      cx += o.x;  cy += o.y;
+      n++;
+    }
+  }
+  if (n > 0) {
+    ax = (ax / n - b.vx) * b.alignW;
+    ay = (ay / n - b.vy) * b.alignW;
+    cx = (cx / n - b.x)  * b.cohesionW;
+    cy = (cy / n - b.y)  * b.cohesionW;
+  }
+  return { fx: sx * b.separationW + ax + cx, fy: sy * b.separationW + ay + cy };
+}
+
+function updateFlock() {
+  const roof = getRoofline();
+
+  // ── idle ──────────────────────────────────────────────────────────────────
+  if (FLOCK.state === 'idle') {
+    if (++FLOCK.timer >= FLOCK.nextVisit) {
+      FLOCK.state = 'approaching';
+      FLOCK.timer = 0;
+      initFlock();
+    }
+    return;
+  }
+
+  // ── approaching / landing ─────────────────────────────────────────────────
+  if (FLOCK.state === 'approaching') {
+    let allLanded = true;
+
+    for (const b of FLOCK.birds) {
+
+      if (b.subState === 'landed') continue;
+      allLanded = false;
+
+      if (b.subState === 'flying') {
+        b.landTimer++;
+
+        // Loose boids toward a wide holding area above the roof
+        const { fx, fy } = boidForces(b, FLOCK.birds);
+        // Drift toward above-roof zone — loose pull, not magnetic
+        const holdX = roof.x + roof.w * (0.3 + 0.4 * Math.random() * 0.01);
+        const holdY = roof.y - 55;
+        const toHX = (holdX - b.x) * 0.0018;
+        const toHY = (holdY - b.y) * 0.0018;
+
+        b.vx += fx + toHX + (Math.random() - 0.5) * 0.04;
+        b.vy += fy + toHY + (Math.random() - 0.5) * 0.03;
+
+        // Speed clamp — per bird
+        const spd = Math.hypot(b.vx, b.vy) || 0.01;
+        if (spd > b.maxSpd) { b.vx = b.vx / spd * b.maxSpd; b.vy = b.vy / spd * b.maxSpd; }
+        if (spd < 0.8)      { b.vx = b.vx / spd * 0.8;      b.vy = b.vy / spd * 0.8; }
+
+        b.x += b.vx;
+        b.y += b.vy;
+
+        // Once timer expires AND bird is roughly above the roof, peel off to descend
+        const aboveRoof = b.x > roof.x - 20 && b.x < roof.x + roof.w + 20 && b.y < roof.y + 10;
+        if (b.landTimer >= b.landDelay && aboveRoof) {
+          b.subState = 'descending';
+        }
+
+      } else if (b.subState === 'descending') {
+        // Break from flock entirely — steer directly to roost spot, decelerate
+        const dx = b.roostX - b.x;
+        const dy = b.roostY - b.y;
+        const dist = Math.hypot(dx, dy) || 0.01;
+
+        // Proportional steering: stronger pull the closer we get
+        const pull = Math.min(0.18, 2.2 / dist);
+        b.vx += (dx / dist) * pull;
+        b.vy += (dy / dist) * pull;
+
+        // Heavy damping so it slows as it arrives
+        b.vx *= 0.82;
+        b.vy *= 0.82;
+
+        b.x += b.vx;
+        b.y += b.vy;
+
+        if (dist < 2.5) {
+          b.x = b.roostX;
+          b.y = b.roostY;
+          b.vx = 0; b.vy = 0;
+          b.subState = 'landed';
+        }
+      }
+    }
+
+    if (allLanded) {
+      FLOCK.state = 'roosting';
+      FLOCK.roostTimer = 0;
+    }
+    return;
+  }
+
+  // ── roosting ──────────────────────────────────────────────────────────────
+  if (FLOCK.state === 'roosting') {
+    FLOCK.roostTimer++;
+    for (const b of FLOCK.birds) {
+      b.shufflePhase += b.shuffleSpeed;
+      b.y = b.roostY + Math.sin(b.shufflePhase) * 0.5;
+    }
+    if (FLOCK.roostTimer >= FLOCK.roostDuration) {
+      FLOCK.state = 'departing';
+      FLOCK.departTimer = 0;
+      const n = FLOCK.birds.length;
+      for (let i = 0; i < n; i++) {
+        const dist = Math.abs(i - FLOCK.departIdx);
+        FLOCK.birds[i].departDelay = dist * (3 + Math.random() * 6);
+        FLOCK.birds[i].departTimer = 0;
+        FLOCK.birds[i].subState = 'landed'; // will flip to departing below
+      }
+    }
+    return;
+  }
+
+  // ── departing ─────────────────────────────────────────────────────────────
+  if (FLOCK.state === 'departing') {
+    const birds = FLOCK.birds;
+    let allGone = true;
+
+    for (const b of birds) {
+      if (b.subState === 'landed') {
+        b.departTimer++;
+        if (b.departTimer < b.departDelay) { allGone = false; continue; }
+        b.subState = 'departing';
+        b.vx = (1.2 + Math.random() * 1.8) * (Math.random() < 0.7 ? 1 : -1);
+        b.vy = -(1.5 + Math.random() * 1.5);
+      }
+
+      if (b.subState === 'departing') {
+        const flying = birds.filter(o => o.subState === 'departing');
+        const { fx, fy } = boidForces(b, flying);
+        b.vx += fx + 0.03;
+        b.vy += fy + 0.012;
+
+        const spd = Math.hypot(b.vx, b.vy) || 0.01;
+        if (spd > 4.5) { b.vx = b.vx / spd * 4.5; b.vy = b.vy / spd * 4.5; }
+
+        b.x += b.vx;
+        b.y += b.vy;
+
+        if (b.x < W + 80 && b.x > -80 && b.y > -80) allGone = false;
+      }
+    }
+
+    if (allGone) {
+      FLOCK.state = 'idle';
+      FLOCK.timer = 0;
+      FLOCK.nextVisit = (180 + Math.random() * 180) * 60;
+      FLOCK.birds = [];
+    }
+    return;
+  }
+}
+
+function drawFlock() {
+  if (FLOCK.state === 'idle') return;
+  const darkness = getDarkness();
+  const birdAlpha = 0.78 + darkness * 0.15;
+
+  ctx.save();
+  ctx.fillStyle = `rgba(8,10,16,${birdAlpha})`;
+
+  for (const b of FLOCK.birds) {
+    if (b.subState === 'landed') {
+      ctx.fillRect(Math.round(b.x) - 1, Math.round(b.y) - 1, 2, 2);
+    } else {
+      const angle = Math.atan2(b.vy, b.vx);
+      ctx.save();
+      ctx.translate(Math.round(b.x), Math.round(b.y));
+      ctx.rotate(angle);
+      ctx.fillRect(-3, -1, 2, 1); // left wing
+      ctx.fillRect( 1, -1, 2, 1); // right wing
+      ctx.fillRect(-1,  0, 2, 1); // body
+      ctx.restore();
+    }
+  }
+
+  ctx.restore();
+}
+
+
+
+
+// ── Motorcycle ────────────────────────────────────────────────────────────────
+const MOTO = {
+  active: false,
+  x: 0,
+  y: 0,
+  dir: 1,          // 1 = L→R, -1 = R→L
+  speed: 0,
+  passenger: false,
+  nextPass: (15 + Math.random() * 20) * 60, // first pass: 15–35 s for testing
+  timer: 0,
+  // audio nodes — created fresh each pass, destroyed after
+  gainNode: null,
+  engineOsc1: null,
+  engineOsc2: null,
+  lfoNode: null,
+};
+
+function spawnMoto() {
+  MOTO.active   = true;
+  MOTO.dir      = Math.random() < 0.65 ? 1 : -1;  // mostly L→R
+  MOTO.passenger = Math.random() < 0.18;           // passenger ~1 in 5
+  // y varies slightly each pass — stays on the road
+  MOTO.y = groundY + Math.floor((H - groundY) * (0.12 + Math.random() * 0.14));
+  // ~4s to cross: speed = W / (4 * 60)
+  MOTO.speed = W / 240;
+  MOTO.x = MOTO.dir === 1 ? -120 : W + 120;
+  startMotoAudio();
+}
+
+function scheduleMoto() {
+  // 18–24 min between passes after first
+  MOTO.nextPass = (1080 + Math.random() * 360) * 60;
+  MOTO.timer    = 0;
+}
+
+// ── Harley audio: V-twin potato-potato idle ──────────────────────────────────
+function startMotoAudio() {
+  if (!audioCtx) return;
+
+  const t = audioCtx.currentTime;
+
+  // Master gain — will be automated for doppler fade
+  const masterGain = audioCtx.createGain();
+  masterGain.gain.setValueAtTime(0, t);
+  masterGain.connect(audioCtx.destination);
+  MOTO.gainNode = masterGain;
+
+  // V-twin: two oscillators slightly detuned, ~90 Hz fundamental
+  // The uneven firing interval is approximated by a slow irregular LFO
+  const osc1 = audioCtx.createOscillator();
+  const osc2 = audioCtx.createOscillator();
+  osc1.type = 'sawtooth';
+  osc2.type = 'sawtooth';
+  osc1.frequency.setValueAtTime(88, t);
+  osc2.frequency.setValueAtTime(92, t);
+
+  // Shape the raw sawtooth into something more throbby
+  const lp = audioCtx.createBiquadFilter();
+  lp.type = 'lowpass';
+  lp.frequency.value = 280;
+  lp.Q.value = 2.2;
+
+  const hp = audioCtx.createBiquadFilter();
+  hp.type = 'highpass';
+  hp.frequency.value = 45;
+
+  // LFO for the potato-potato uneven beat: ~6 Hz, modulates gain
+  const lfo = audioCtx.createOscillator();
+  lfo.frequency.setValueAtTime(5.8, t);
+  lfo.type = 'sine';
+  const lfoGain = audioCtx.createGain();
+  lfoGain.gain.value = 0.35;
+  lfo.connect(lfoGain);
+
+  // Second slower LFO for the irregular "lope" character
+  const lfo2 = audioCtx.createOscillator();
+  lfo2.frequency.setValueAtTime(2.9, t);
+  lfo2.type = 'sine';
+  const lfo2Gain = audioCtx.createGain();
+  lfo2Gain.gain.value = 0.18;
+  lfo2.connect(lfo2Gain);
+
+  // Shape gain — sits between filter and master
+  const shapeGain = audioCtx.createGain();
+  shapeGain.gain.setValueAtTime(0.7, t);
+  lfoGain.connect(shapeGain.gain);
+  lfo2Gain.connect(shapeGain.gain);
+
+  osc1.connect(lp);
+  osc2.connect(lp);
+  lp.connect(hp);
+  hp.connect(shapeGain);
+  shapeGain.connect(masterGain);
+
+  osc1.start(t); osc2.start(t);
+  lfo.start(t);  lfo2.start(t);
+
+  MOTO.engineOsc1 = osc1;
+  MOTO.engineOsc2 = osc2;
+  MOTO.lfoNode    = lfo;
+  MOTO._lfo2      = lfo2;
+  MOTO._shapeGain = shapeGain;
+}
+
+function stopMotoAudio() {
+  if (!audioCtx) return;
+  const t = audioCtx.currentTime;
+  if (MOTO.gainNode)    { MOTO.gainNode.gain.setTargetAtTime(0, t, 0.25); }
+  // Stop sources after fade
+  setTimeout(() => {
+    try { MOTO.engineOsc1.stop(); } catch(e) {}
+    try { MOTO.engineOsc2.stop(); } catch(e) {}
+    try { MOTO.lfoNode.stop();    } catch(e) {}
+    try { MOTO._lfo2.stop();      } catch(e) {}
+  }, 800);
+}
+
+function updateMotoAudio() {
+  if (!audioCtx || !MOTO.gainNode) return;
+  const t = audioCtx.currentTime;
+
+  // Position 0..1 across screen
+  const prog = MOTO.dir === 1
+    ? MOTO.x / W
+    : 1 - (MOTO.x / W);
+
+  // Gain envelope: fade in first 15% of travel, fade out last 15%
+  let gain;
+  if (prog < 0.15)       gain = prog / 0.15;
+  else if (prog > 0.85)  gain = (1 - prog) / 0.15;
+  else                   gain = 1.0;
+  gain = gain * 0.28; // master volume ceiling
+
+  MOTO.gainNode.gain.setTargetAtTime(gain, t, 0.08);
+
+  // Doppler: pitch slightly higher approaching, drops as it passes center
+  // Approaching = prog < 0.5, receding = prog > 0.5
+  const dopplerShift = MOTO.dir === 1
+    ? (prog < 0.5 ? 1.012 : 0.988)
+    : (prog < 0.5 ? 0.988 : 1.012);
+
+  MOTO.engineOsc1.frequency.setTargetAtTime(88 * dopplerShift, t, 0.3);
+  MOTO.engineOsc2.frequency.setTargetAtTime(92 * dopplerShift, t, 0.3);
+}
+
+function updateMoto() {
+  if (!MOTO.active) {
+    MOTO.timer++;
+    if (MOTO.timer >= MOTO.nextPass) spawnMoto();
+    return;
+  }
+
+  MOTO.x += MOTO.speed * MOTO.dir;
+  updateMotoAudio();
+
+  const offscreen = MOTO.dir === 1 ? MOTO.x > W + 140 : MOTO.x < -140;
+  if (offscreen) {
+    stopMotoAudio();
+    MOTO.active   = false;
+    MOTO.gainNode = null;
+    scheduleMoto();
+  }
+}
+
+// ── Draw motorcycle silhouette ────────────────────────────────────────────────
+function drawMoto() {
+  if (!MOTO.active) return;
+
+  const x = Math.round(MOTO.x);
+  const y = Math.round(MOTO.y);
+  const dir = MOTO.dir; // 1=right, -1=left
+
+  // Scale: bike should be ~3.5% of screen height
+  const sc = H * 0.035 / 38; // 38px = design height
+
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.scale(dir * sc, sc); // flip horizontally when going left
+  ctx.fillStyle = '#060810';
+
+  // ── Wheels ────────────────────────────────────────────────────────────────
+  // Rear wheel (left in design)
+  drawCircleOutline(-28, 0, 13, 2.5);
+  // Front wheel (right)
+  drawCircleOutline(22, 2, 11, 2);
+
+  // ── Frame / engine block ──────────────────────────────────────────────────
+  // Main frame spine
+  ctx.fillRect(-20, -18, 34, 5);
+  // Engine block — boxy, low
+  ctx.fillRect(-14, -14, 22, 12);
+  // Primary cover (left side bulge)
+  ctx.fillRect(-20, -10, 8, 8);
+
+  // ── Exhaust pipes — two stacked, horizontal, rear ────────────────────────
+  ctx.fillRect(-30, -4, 16, 3);
+  ctx.fillRect(-30, -8, 14, 2);
+
+  // ── Rear hard bags (saddlebags) ───────────────────────────────────────────
+  ctx.fillRect(-34, -14, 10, 12);
+  // Bag latch suggestion
+  ctx.fillStyle = '#0C1220';
+  ctx.fillRect(-31, -10, 4, 5);
+  ctx.fillStyle = '#060810';
+
+  // ── Front forks — raked forward ───────────────────────────────────────────
+  // Lower fork legs
+  ctx.save();
+  ctx.translate(18, -6);
+  ctx.rotate(-0.22); // rake angle
+  ctx.fillRect(-2, 0, 4, 18);
+  ctx.restore();
+
+  // ── Fairing / headlight nacelle ───────────────────────────────────────────
+  ctx.beginPath();
+  ctx.moveTo(22, -14);
+  ctx.bezierCurveTo(34, -14, 38, -8, 36, -2);
+  ctx.bezierCurveTo(34,  4,  28,  6, 22,  4);
+  ctx.lineTo(20, -14);
+  ctx.closePath();
+  ctx.fill();
+
+  // Headlight (tiny bright rectangle on fairing)
+  ctx.fillStyle = 'rgba(255,240,180,0.7)';
+  ctx.fillRect(33, -6, 3, 4);
+  ctx.fillStyle = '#060810';
+
+  // ── Fuel tank ─────────────────────────────────────────────────────────────
+  ctx.beginPath();
+  ctx.moveTo(-8, -22);
+  ctx.bezierCurveTo(-4, -26, 10, -26, 14, -22);
+  ctx.lineTo(14, -18);
+  ctx.lineTo(-8, -18);
+  ctx.closePath();
+  ctx.fill();
+
+  // ── Rider ────────────────────────────────────────────────────────────────
+  // Torso — bagger rider sits more upright than sport
+  ctx.fillRect(-4, -40, 9, 14); // torso
+  // Head/helmet
+  ctx.beginPath();
+  ctx.arc(1, -44, 6, 0, Math.PI * 2);
+  ctx.fill();
+  // Arms forward to bars
+  ctx.fillRect(2, -34, 16, 3);
+  // Leg
+  ctx.fillRect(-8, -20, 6, 8);
+
+  // ── Optional passenger ────────────────────────────────────────────────────
+  if (MOTO.passenger) {
+    ctx.fillRect(-16, -38, 8, 12); // torso behind rider
+    ctx.beginPath();
+    ctx.arc(-12, -42, 5, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  ctx.restore();
+}
+
+// Helper: filled circle outline (ring) using two arcs
+function drawCircleOutline(cx, cy, r, thickness) {
+  ctx.beginPath();
+  ctx.arc(cx, cy, r, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = '#0C1520'; // slightly lighter center = wheel hole
+  ctx.beginPath();
+  ctx.arc(cx, cy, r - thickness, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = '#060810';
+  // Hub dot
+  ctx.beginPath();
+  ctx.arc(cx, cy, 2, 0, Math.PI * 2);
+  ctx.fill();
+}
+
+
+
+function gameLoop() {
+  cycleFrame = (cycleFrame + 1) % CYCLE_FRAMES;
+  ctx.clearRect(0, 0, W, H);
+  drawSky();
+  drawBackground();
+  drawWisps();
+  drawFlock();
+  drawMoto();
+  updateWind();
+  updateWisps();
+  updateWindowFlicker();
+  updateFlock();
+  updateMoto();
+  frameId = requestAnimationFrame(gameLoop);
+}
+
+function startLoop() {
+  cycleFrame = (cycleFrame + 1) % CYCLE_FRAMES;
+  ctx.clearRect(0, 0, W, H);
+  drawSky();
+  drawBackground();
+  drawWisps();
+  updateWind();
+  updateWisps();
+  frameId = requestAnimationFrame(startLoop);
+}
+
+// ── Init ──────────────────────────────────────────────────────────────────────
+// Start at dusk (phase 0.5 = most colorful point of cycle)
+cycleFrame = Math.floor(CYCLE_FRAMES * 0.50);
+
+initWisps();
+startLoop();
+
+document.body.addEventListener('click', () => {
+  if (gameRunning) return;
+  gameRunning = true;
+  try { initAudio(); } catch(e) {}
+  startScreen.style.display = 'none';
+  cancelAnimationFrame(frameId);
+  gameLoop();
+});
+</script>
+</body>
+</html>
